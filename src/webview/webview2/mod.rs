@@ -10,6 +10,7 @@ use crate::{
 };
 
 use file_drop::FileDropController;
+use raw_window_handle::RawWindowHandle;
 use url::Url;
 
 use std::{
@@ -50,7 +51,7 @@ use webview2_com::{Microsoft::Web::WebView2::Win32::*, *};
 use crate::application::{platform::windows::WindowExtWindows, window::Window};
 use http::Request;
 
-use super::Theme;
+use super::{Theme, WindowHandle};
 
 impl From<webview2_com::Error> for Error {
   fn from(err: webview2_com::Error) -> Self {
@@ -70,26 +71,32 @@ pub(crate) struct InnerWebView {
 
 impl InnerWebView {
   pub fn new(
-    window: Rc<Window>,
+    window: WindowHandle,
     mut attributes: WebViewAttributes,
     pl_attrs: super::PlatformSpecificWebViewAttributes,
     web_context: Option<&mut WebContext>,
   ) -> Result<Self> {
-    let hwnd = HWND(window.hwnd() as _);
-    let file_drop_controller: Rc<OnceCell<FileDropController>> = Rc::new(OnceCell::new());
-    let file_drop_handler = attributes.file_drop_handler.take();
-    let file_drop_window = window.clone();
+    let hwnd = match window {
+      WindowHandle::TaoWindow(ref window) => HWND(window.hwnd() as _),
+      WindowHandle::RawWindow(RawWindowHandle::Win32(handle)) => HWND(handle.hwnd as _),
+      _ => unreachable!(),
+    };
 
     let env = Self::create_environment(&web_context, pl_attrs.clone(), &attributes)?;
     let controller = Self::create_controller(hwnd, &env, attributes.incognito)?;
-    let webview = Self::init_webview(window, hwnd, attributes, &env, &controller, pl_attrs)?;
 
-    if let Some(file_drop_handler) = file_drop_handler {
-      let mut controller = FileDropController::new();
-      controller.listen(hwnd, file_drop_window, file_drop_handler);
-      let _ = file_drop_controller.set(controller);
+    let file_drop_controller: Rc<OnceCell<FileDropController>> = Rc::new(OnceCell::new());
+    if let WindowHandle::TaoWindow(ref window) = window {
+      let file_drop_handler = attributes.file_drop_handler.take();
+      let file_drop_window = window.clone();
+      if let Some(file_drop_handler) = file_drop_handler {
+        let mut controller = FileDropController::new();
+        controller.listen(hwnd, file_drop_window, file_drop_handler);
+        let _ = file_drop_controller.set(controller);
+      }
     }
 
+    let webview = Self::init_webview(window, hwnd, attributes, &env, &controller, pl_attrs)?;
     Ok(Self {
       controller,
       webview,
@@ -224,7 +231,7 @@ impl InnerWebView {
   }
 
   fn init_webview(
-    window: Rc<Window>,
+    window: WindowHandle,
     hwnd: HWND,
     mut attributes: WebViewAttributes,
     env: &ICoreWebView2Environment,
@@ -311,27 +318,6 @@ impl InnerWebView {
         .map_err(webview2_com::Error::WindowsError)?;
     }
 
-    // document title changed handler
-    if let Some(document_title_changed_handler) = attributes.document_title_changed_handler {
-      let window_c = window.clone();
-      unsafe {
-        webview
-          .add_DocumentTitleChanged(
-            &DocumentTitleChangedEventHandler::create(Box::new(move |webview, _| {
-              let mut title = PWSTR::null();
-              if let Some(webview) = webview {
-                webview.DocumentTitle(&mut title)?;
-                let title = take_pwstr(title);
-                document_title_changed_handler(&window_c, title);
-              }
-              Ok(())
-            })),
-            &mut token,
-          )
-          .map_err(webview2_com::Error::WindowsError)?;
-      }
-    }
-
     if let Some(on_page_load_handler) = attributes.on_page_load_handler {
       let on_page_load_handler = Arc::new(on_page_load_handler);
       let on_page_load_handler_ = on_page_load_handler.clone();
@@ -383,61 +369,88 @@ window.addEventListener('mousemove', (e) => window.chrome.webview.postMessage('_
       Self::add_script_to_execute_on_document_created(&webview, js)?;
     }
 
-    // Message handler
-    let ipc_handler = attributes.ipc_handler.take();
-    unsafe {
-      webview.add_WebMessageReceived(
-        &WebMessageReceivedEventHandler::create(Box::new(move |_, args| {
-          if let Some(args) = args {
-            let mut js = PWSTR::null();
-            args.TryGetWebMessageAsString(&mut js)?;
-            let js = take_pwstr(js);
-            if js == "__WEBVIEW_LEFT_MOUSE_DOWN__" || js == "__WEBVIEW_MOUSE_MOVE__" {
-              if !window.is_decorated() && window.is_resizable() && !window.is_maximized() {
-                use crate::application::{platform::windows::hit_test, window::CursorIcon};
-
-                let mut point = POINT::default();
-                win32wm::GetCursorPos(&mut point);
-                let result = hit_test(window.hwnd(), point.x, point.y);
-                let cursor = match result.0 as u32 {
-                  win32wm::HTLEFT => CursorIcon::WResize,
-                  win32wm::HTTOP => CursorIcon::NResize,
-                  win32wm::HTRIGHT => CursorIcon::EResize,
-                  win32wm::HTBOTTOM => CursorIcon::SResize,
-                  win32wm::HTTOPLEFT => CursorIcon::NwResize,
-                  win32wm::HTTOPRIGHT => CursorIcon::NeResize,
-                  win32wm::HTBOTTOMLEFT => CursorIcon::SwResize,
-                  win32wm::HTBOTTOMRIGHT => CursorIcon::SeResize,
-                  _ => CursorIcon::Arrow,
-                };
-                // don't use `CursorIcon::Arrow` variant or cursor manipulation using css will cause cursor flickering
-                if cursor != CursorIcon::Arrow {
-                  window.set_cursor_icon(cursor);
+    if let WindowHandle::TaoWindow(window) = window {
+      // document title changed handler
+      if let Some(document_title_changed_handler) = attributes.document_title_changed_handler {
+        let window_c = window.clone();
+        unsafe {
+          webview
+            .add_DocumentTitleChanged(
+              &DocumentTitleChangedEventHandler::create(Box::new(move |webview, _| {
+                let mut title = PWSTR::null();
+                if let Some(webview) = webview {
+                  webview.DocumentTitle(&mut title)?;
+                  let title = take_pwstr(title);
+                  document_title_changed_handler(&window_c, title);
                 }
+                Ok(())
+              })),
+              &mut token,
+            )
+            .map_err(webview2_com::Error::WindowsError)?;
+        }
+      }
+      // Message handler
+      let ipc_handler = attributes.ipc_handler.take();
+      unsafe {
+        webview.add_WebMessageReceived(
+          &WebMessageReceivedEventHandler::create(Box::new(move |_, args| {
+            if let Some(args) = args {
+              let mut js = PWSTR::null();
+              args.TryGetWebMessageAsString(&mut js)?;
+              let js = take_pwstr(js);
+              if js == "__WEBVIEW_LEFT_MOUSE_DOWN__" || js == "__WEBVIEW_MOUSE_MOVE__" {
+                if !window.is_decorated() && window.is_resizable() && !window.is_maximized() {
+                  use crate::application::{platform::windows::hit_test, window::CursorIcon};
 
-                if js == "__WEBVIEW_LEFT_MOUSE_DOWN__" {
-                  // we ignore `HTCLIENT` variant so the webview receives the click correctly if it is not on the edges
-                  // and prevent conflict with `tao::window::drag_window`.
-                  if result.0 as u32 != win32wm::HTCLIENT {
-                    window.begin_resize_drag(result.0, win32wm::WM_NCLBUTTONDOWN, point.x, point.y);
+                  let mut point = POINT::default();
+                  win32wm::GetCursorPos(&mut point);
+                  let result = hit_test(window.hwnd(), point.x, point.y);
+                  let cursor = match result.0 as u32 {
+                    win32wm::HTLEFT => CursorIcon::WResize,
+                    win32wm::HTTOP => CursorIcon::NResize,
+                    win32wm::HTRIGHT => CursorIcon::EResize,
+                    win32wm::HTBOTTOM => CursorIcon::SResize,
+                    win32wm::HTTOPLEFT => CursorIcon::NwResize,
+                    win32wm::HTTOPRIGHT => CursorIcon::NeResize,
+                    win32wm::HTBOTTOMLEFT => CursorIcon::SwResize,
+                    win32wm::HTBOTTOMRIGHT => CursorIcon::SeResize,
+                    _ => CursorIcon::Arrow,
+                  };
+                  // don't use `CursorIcon::Arrow` variant or cursor manipulation using css will cause cursor flickering
+                  if cursor != CursorIcon::Arrow {
+                    window.set_cursor_icon(cursor);
+                  }
+
+                  if js == "__WEBVIEW_LEFT_MOUSE_DOWN__" {
+                    // we ignore `HTCLIENT` variant so the webview receives the click correctly if it is not on the edges
+                    // and prevent conflict with `tao::window::drag_window`.
+                    if result.0 as u32 != win32wm::HTCLIENT {
+                      window.begin_resize_drag(
+                        result.0,
+                        win32wm::WM_NCLBUTTONDOWN,
+                        point.x,
+                        point.y,
+                      );
+                    }
                   }
                 }
+                // these are internal messages, ipc_handlers don't need it so exit early
+                return Ok(());
               }
-              // these are internal messages, ipc_handlers don't need it so exit early
-              return Ok(());
+
+              if let Some(ipc_handler) = &ipc_handler {
+                ipc_handler(&window, js);
+              }
             }
 
-            if let Some(ipc_handler) = &ipc_handler {
-              ipc_handler(&window, js);
-            }
-          }
-
-          Ok(())
-        })),
-        &mut token,
-      )
+            Ok(())
+          })),
+          &mut token,
+        )
+      }
+      .map_err(webview2_com::Error::WindowsError)?;
     }
-    .map_err(webview2_com::Error::WindowsError)?;
 
     if let Some(nav_callback) = attributes.navigation_handler {
       unsafe {

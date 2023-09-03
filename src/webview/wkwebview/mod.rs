@@ -36,6 +36,7 @@ use objc::{
   runtime::{Class, Object, Sel, BOOL},
 };
 use objc_id::Id;
+use raw_window_handle::RawWindowHandle;
 
 #[cfg(target_os = "macos")]
 use crate::application::platform::macos::WindowExtMacOS;
@@ -78,6 +79,8 @@ use http::{
   Request, Response,
 };
 
+use super::WindowHandle;
+
 const IPC_MESSAGE_HANDLER_NAME: &str = "ipc";
 const ACCEPT_FIRST_MOUSE: &str = "accept_first_mouse";
 
@@ -103,7 +106,7 @@ pub(crate) struct InnerWebView {
 
 impl InnerWebView {
   pub fn new(
-    window: Rc<Window>,
+    window: WindowHandle,
     attributes: WebViewAttributes,
     _pl_attrs: super::PlatformSpecificWebViewAttributes,
     _web_context: Option<&mut WebContext>,
@@ -295,7 +298,9 @@ impl InnerWebView {
         Some(mut decl) => {
           #[cfg(target_os = "macos")]
           {
-            add_file_drop_methods(&mut decl);
+            if let WindowHandle::TaoWindow(_) = window {
+              add_file_drop_methods(&mut decl);
+            }
             synthetic_mouse_events::setup(&mut decl);
             decl.add_ivar::<bool>(ACCEPT_FIRST_MOUSE);
             decl.add_method(
@@ -377,7 +382,11 @@ impl InnerWebView {
 
       #[cfg(target_os = "ios")]
       {
-        let ui_view = window.ui_view() as id;
+        let ui_view = match window {
+          WindowHandle::TaoWindow(window) => window.ui_view() as id,
+          WindowHandle::RawWindow(RawWindowHandle::UIKit(handle)) => handle.ui_view as id,
+          _ => unreachable!(),
+        };
         let frame: CGRect = msg_send![ui_view, frame];
         // set all autoresizingmasks
         let () = msg_send![webview, setAutoresizingMask: 31];
@@ -409,25 +418,30 @@ impl InnerWebView {
 
       // Message handler
       let ipc_handler_ptr = if let Some(ipc_handler) = attributes.ipc_handler {
-        let cls = ClassDecl::new("WebViewDelegate", class!(NSObject));
-        let cls = match cls {
-          Some(mut cls) => {
-            cls.add_ivar::<*mut c_void>("function");
-            cls.add_method(
-              sel!(userContentController:didReceiveScriptMessage:),
-              did_receive as extern "C" fn(&Object, Sel, id, id),
-            );
-            cls.register()
-          }
-          None => class!(WebViewDelegate),
-        };
-        let handler: id = msg_send![cls, new];
-        let ipc_handler_ptr = Box::into_raw(Box::new((ipc_handler, window.clone())));
+        match &window {
+          WindowHandle::TaoWindow(window) => {
+            let cls = ClassDecl::new("WebViewDelegate", class!(NSObject));
+            let cls = match cls {
+              Some(mut cls) => {
+                cls.add_ivar::<*mut c_void>("function");
+                cls.add_method(
+                  sel!(userContentController:didReceiveScriptMessage:),
+                  did_receive as extern "C" fn(&Object, Sel, id, id),
+                );
+                cls.register()
+              }
+              None => class!(WebViewDelegate),
+            };
+            let handler: id = msg_send![cls, new];
+            let ipc_handler_ptr = Box::into_raw(Box::new((ipc_handler, window.clone())));
 
-        (*handler).set_ivar("function", ipc_handler_ptr as *mut _ as *mut c_void);
-        let ipc = NSString::new(IPC_MESSAGE_HANDLER_NAME);
-        let _: () = msg_send![manager, addScriptMessageHandler:handler name:ipc];
-        ipc_handler_ptr
+            (*handler).set_ivar("function", ipc_handler_ptr as *mut _ as *mut c_void);
+            let ipc = NSString::new(IPC_MESSAGE_HANDLER_NAME);
+            let _: () = msg_send![manager, addScriptMessageHandler:handler name:ipc];
+            ipc_handler_ptr
+          }
+          WindowHandle::RawWindow(_) => null_mut(),
+        }
       } else {
         null_mut()
       };
@@ -436,54 +450,75 @@ impl InnerWebView {
       let document_title_changed_handler = if let Some(document_title_changed_handler) =
         attributes.document_title_changed_handler
       {
-        let cls = ClassDecl::new("DocumentTitleChangedDelegate", class!(NSObject));
-        let cls = match cls {
-          Some(mut cls) => {
-            cls.add_ivar::<*mut c_void>("function");
-            cls.add_method(
-              sel!(observeValueForKeyPath:ofObject:change:context:),
-              observe_value_for_key_path as extern "C" fn(&Object, Sel, id, id, id, id),
-            );
-            extern "C" fn observe_value_for_key_path(
-              this: &Object,
-              _sel: Sel,
-              key_path: id,
-              of_object: id,
-              _change: id,
-              _context: id,
-            ) {
-              let key = NSString(key_path);
-              if key.to_str() == "title" {
-                unsafe {
-                  let function = this.get_ivar::<*mut c_void>("function");
-                  if !function.is_null() {
-                    let function = &mut *(*function
-                      as *mut (Box<dyn for<'r> Fn(&'r Window, String)>, Rc<Window>));
-                    let title: id = msg_send![of_object, title];
-                    (function.0)(&function.1, NSString(title).to_str().to_string());
+        match &window {
+          WindowHandle::TaoWindow(window) => {
+            let cls = ClassDecl::new("DocumentTitleChangedDelegate", class!(NSObject));
+            let cls = match cls {
+              Some(mut cls) => {
+                cls.add_ivar::<*mut c_void>("function");
+                cls.add_method(
+                  sel!(observeValueForKeyPath:ofObject:change:context:),
+                  observe_value_for_key_path as extern "C" fn(&Object, Sel, id, id, id, id),
+                );
+                extern "C" fn observe_value_for_key_path(
+                  this: &Object,
+                  _sel: Sel,
+                  key_path: id,
+                  of_object: id,
+                  _change: id,
+                  _context: id,
+                ) {
+                  let key = NSString(key_path);
+                  if key.to_str() == "title" {
+                    unsafe {
+                      let function = this.get_ivar::<*mut c_void>("function");
+                      if !function.is_null() {
+                        let function = &mut *(*function
+                          as *mut (Box<dyn for<'r> Fn(&'r Window, String)>, Rc<Window>));
+                        let title: id = msg_send![of_object, title];
+                        (function.0)(&function.1, NSString(title).to_str().to_string());
+                      }
+                    }
                   }
                 }
+                cls.register()
               }
-            }
-            cls.register()
+              None => class!(DocumentTitleChangedDelegate),
+            };
+
+            let handler: id = msg_send![cls, new];
+            let document_title_changed_handler =
+              Box::into_raw(Box::new((document_title_changed_handler, window.clone())));
+
+            (*handler).set_ivar(
+              "function",
+              document_title_changed_handler as *mut _ as *mut c_void,
+            );
+
+            let _: () = msg_send![webview, addObserver:handler forKeyPath:NSString::new("title") options:0x01 context:nil ];
+
+            document_title_changed_handler
           }
-          None => class!(DocumentTitleChangedDelegate),
-        };
-
-        let handler: id = msg_send![cls, new];
-        let document_title_changed_handler =
-          Box::into_raw(Box::new((document_title_changed_handler, window.clone())));
-
-        (*handler).set_ivar(
-          "function",
-          document_title_changed_handler as *mut _ as *mut c_void,
-        );
-
-        let _: () = msg_send![webview, addObserver:handler forKeyPath:NSString::new("title") options:0x01 context:nil ];
-
-        document_title_changed_handler
+          WindowHandle::RawWindow(_) => null_mut(),
+        }
       } else {
         null_mut()
+      };
+
+      // File drop handling
+      #[cfg(target_os = "macos")]
+      let file_drop_ptr = match &window {
+        WindowHandle::TaoWindow(window) => {
+          match attributes.file_drop_handler {
+            // if we have a file_drop_handler defined, use the defined handler
+            Some(file_drop_handler) => {
+              set_file_drop_handler(webview, window.clone(), file_drop_handler)
+            }
+            // prevent panic by using a blank handler
+            None => set_file_drop_handler(webview, window.clone(), Box::new(|_, _| false)),
+          }
+        }
+        WindowHandle::RawWindow(_) => null_mut(),
       };
 
       // Navigation handler
@@ -745,21 +780,14 @@ impl InnerWebView {
       let ui_delegate: id = msg_send![ui_delegate, new];
       let _: () = msg_send![webview, setUIDelegate: ui_delegate];
 
-      // File drop handling
-      #[cfg(target_os = "macos")]
-      let file_drop_ptr = match attributes.file_drop_handler {
-        // if we have a file_drop_handler defined, use the defined handler
-        Some(file_drop_handler) => {
-          set_file_drop_handler(webview, window.clone(), file_drop_handler)
-        }
-        // prevent panic by using a blank handler
-        None => set_file_drop_handler(webview, window.clone(), Box::new(|_, _| false)),
-      };
-
       // ns window is required for the print operation
       #[cfg(target_os = "macos")]
       let ns_window = {
-        let ns_window = window.ns_window() as id;
+        let ns_window = match &window {
+          WindowHandle::TaoWindow(window) => window.ns_window() as id,
+          WindowHandle::RawWindow(RawWindowHandle::AppKit(handle)) => handle.ns_window as id,
+          _ => unreachable!(),
+        };
 
         let can_set_titlebar_style: BOOL = msg_send![
           ns_window,
@@ -848,7 +876,11 @@ r#"Object.defineProperty(window, 'ipc', {
         let _: () = msg_send![parent_view, addSubview: webview];
 
         // inject the webview into the window
-        let ns_window = window.ns_window() as id;
+        let ns_window = match window {
+          WindowHandle::TaoWindow(window) => window.ns_window() as id,
+          WindowHandle::RawWindow(RawWindowHandle::AppKit(handle)) => handle.ns_window as id,
+          _ => unreachable!(),
+        };
         // Tell the webview receive keyboard events in the window.
         // See https://github.com/tauri-apps/wry/issues/739
         let _: () = msg_send![ns_window, setContentView: parent_view];
@@ -862,7 +894,11 @@ r#"Object.defineProperty(window, 'ipc', {
 
       #[cfg(target_os = "ios")]
       {
-        let ui_view = window.ui_view() as id;
+        let ui_view = match window {
+          WindowHandle::TaoWindow(window) => window.ui_view() as id,
+          WindowHandle::RawWindow(RawWindowHandle::UIKit(handle)) => handle.ui_view as id,
+          _ => unreachable!(),
+        };
         let _: () = msg_send![ui_view, addSubview: webview];
       }
 

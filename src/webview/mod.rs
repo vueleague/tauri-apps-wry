@@ -7,6 +7,7 @@
 mod proxy;
 mod web_context;
 
+use raw_window_handle::RawWindowHandle;
 pub use web_context::WebContext;
 
 #[cfg(target_os = "android")]
@@ -347,6 +348,12 @@ pub enum PageLoadEvent {
   Finished,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) enum WindowHandle {
+  TaoWindow(Rc<Window>),
+  RawWindow(RawWindowHandle),
+}
+
 /// Builder type of [`WebView`].
 ///
 /// [`WebViewBuilder`] / [`WebView`] are the basic building blocks to construct WebView contents and
@@ -356,12 +363,29 @@ pub struct WebViewBuilder<'a> {
   pub webview: WebViewAttributes,
   platform_specific: PlatformSpecificWebViewAttributes,
   web_context: Option<&'a mut WebContext>,
-  window: Window,
+  window: WindowHandle,
 }
 
 impl<'a> WebViewBuilder<'a> {
   /// Create [`WebViewBuilder`] from provided [`Window`].
   pub fn new(window: Window) -> Result<Self> {
+    let window = WindowHandle::TaoWindow(Rc::new(window));
+    let webview = WebViewAttributes::default();
+    let web_context = None;
+    #[allow(clippy::default_constructed_unit_structs)]
+    let platform_specific = PlatformSpecificWebViewAttributes::default();
+
+    Ok(Self {
+      webview,
+      web_context,
+      window,
+      platform_specific,
+    })
+  }
+
+  /// Create [`WebViewBuilder`] from provided [`RawWindowHandle`].
+  pub fn new_with_rwh(handle: RawWindowHandle) -> Result<Self> {
+    let window: WindowHandle = WindowHandle::RawWindow(handle);
     let webview = WebViewAttributes::default();
     let web_context = None;
     #[allow(clippy::default_constructed_unit_structs)]
@@ -701,7 +725,7 @@ impl<'a> WebViewBuilder<'a> {
   ///
   /// [`EventLoop`]: crate::application::event_loop::EventLoop
   pub fn build(self) -> Result<WebView> {
-    let window = Rc::new(self.window);
+    let window = self.window;
     let webview = InnerWebView::new(
       window.clone(),
       self.webview,
@@ -829,7 +853,7 @@ impl WebViewBuilderExtAndroid for WebViewBuilder<'_> {
 /// [`WebView`] presents the actual WebView window and let you still able to perform actions
 /// during event handling to it. [`WebView`] also contains the associate [`Window`] with it.
 pub struct WebView {
-  window: Rc<Window>,
+  window: WindowHandle,
   webview: InnerWebView,
 }
 
@@ -855,8 +879,13 @@ impl Drop for WebView {
 #[cfg(target_os = "windows")]
 impl Drop for WebView {
   fn drop(&mut self) {
+    let hwnd = match self.window {
+      WindowHandle::TaoWindow(ref window) => HWND(window.hwnd() as _),
+      WindowHandle::RawWindow(RawWindowHandle::Win32(handle)) => HWND(handle.hwnd as _),
+      _ => unreachable!(),
+    };
     unsafe {
-      DestroyWindow(HWND(self.window.hwnd() as _));
+      DestroyWindow(hwnd);
     }
   }
 }
@@ -879,8 +908,14 @@ impl WebView {
   /// Get the [`Window`] associate with the [`WebView`]. This can let you perform window related
   /// actions.
   pub fn window(&self) -> &Window {
-    &self.window
+    match self.window {
+      WindowHandle::TaoWindow(ref window) => window,
+      WindowHandle::RawWindow(_) => {
+        panic!("This webview is created by RawWindowHandle. Call `raw_window_handle` instead.")
+      }
+    }
   }
+  // TODO impl raw window handle
 
   /// Get the current url of the webview
   pub fn url(&self) -> Url {
@@ -953,13 +988,20 @@ impl WebView {
   }
 
   pub fn inner_size(&self) -> PhysicalSize<u32> {
-    #[cfg(target_os = "macos")]
-    {
-      let scale_factor = self.window.scale_factor();
-      self.webview.inner_size(scale_factor)
+    match &self.window {
+      WindowHandle::TaoWindow(window) => {
+        #[cfg(target_os = "macos")]
+        {
+          let scale_factor = window.scale_factor();
+          self.webview.inner_size(scale_factor)
+        }
+        #[cfg(not(target_os = "macos"))]
+        window.inner_size()
+      }
+      WindowHandle::RawWindow(_) => {
+        todo!("This method hasn't been implemented for raw window handle.")
+      }
     }
-    #[cfg(not(target_os = "macos"))]
-    self.window.inner_size()
   }
 
   /// Set the webview zoom level
